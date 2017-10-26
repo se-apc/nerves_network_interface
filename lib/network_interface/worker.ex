@@ -170,7 +170,7 @@ defmodule Nerves.NetworkInterface.Worker do
   end
 
   @typedoc false
-  @type port_resp :: term | no_return
+  @type port_resp :: any | no_return
 
   @typedoc "Command to be sent to the port."
   @type command :: :ifup | :ifdown | :setup | :settings | :interfaces
