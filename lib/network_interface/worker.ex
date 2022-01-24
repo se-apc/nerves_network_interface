@@ -152,8 +152,12 @@ defmodule Nerves.NetworkInterface.Worker do
   end
 
   def handle_call(:interfaces, _from, state) do
-    response = call_port(state, :interfaces, [])
-    {:reply, response, state}
+    available_interfaces = call_port(state, :interfaces, [])
+    response =
+      get_managed_interfaces(available_interfaces)
+        |> intersect(available_interfaces)
+    Logger.debug "#{__MODULE__}: response: #{inspect response}"
+    {:reply, response, state }
   end
 
   def handle_call({:status, ifname}, _from, state) do
@@ -187,10 +191,8 @@ defmodule Nerves.NetworkInterface.Worker do
     {:stop, :normal, state}
   end
 
-  def handle_info({_, {:data, <<?n, message::binary>>}}, state) do
-    {notif, data} = :erlang.binary_to_term(message)
-    Logger.info("nerves_network_interface received #{inspect(notif)} and #{inspect(data)}")
-
+  def dispatch(notif, data) do
+    Logger.debug "nerves_network_interface received #{inspect notif} and #{inspect data}"
     Registry.dispatch(Nerves.NetworkInterface, data.ifname, fn entries ->
       for {pid, _} <- entries do
         Logger.debug("Dispatching for pid = #{inspect pid} notif = #{inspect notif} data = #{inspect data}")
@@ -199,6 +201,15 @@ defmodule Nerves.NetworkInterface.Worker do
         send(pid, {Nerves.NetworkInterface, notif, data})
       end
     end)
+  end
+
+  def handle_info({_, {:data, <<?n, message::binary>>}}, state) do
+    try do
+      {notif, data} = :erlang.binary_to_term(message, [:safe])
+      dispatch(notif, data)
+    rescue
+      e -> Logger.error("Error converting to term: #{inspect e}!")
+    end
     {:noreply, state}
   end
 
@@ -206,7 +217,16 @@ defmodule Nerves.NetworkInterface.Worker do
     {:stop, :unexpected_exit, state}
   end
 
+  @typedoc false
+  @type port_resp :: any | no_return
+
+  @typedoc "Command to be sent to the port."
+  @type command :: :ifup | :ifdown | :setup | :settings | :interfaces
+
+  @typedoc "Arguments for a command"
+  @type command_arguments :: {ifname, options} | ifname
   # Private helper functions
+  @spec call_port(t, command, command_arguments) :: port_resp
   defp call_port(state, command, arguments) do
     msg = {command, arguments}
     send(state.port, {self(), {:command, :erlang.term_to_binary(msg)}})
