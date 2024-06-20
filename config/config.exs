@@ -1,4 +1,4 @@
-use Mix.Config
+import Config
 
 #config :nerves_network_interface, :managed_interfaces,
 #  ["eth0", "ens38"]

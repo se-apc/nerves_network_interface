@@ -42,7 +42,9 @@ defmodule Nerves.NetworkInterface.Mixfile do
     [{:dialyxir,    ">= 0.0.0", only: [:dev, :test]},
      {:elixir_make, "~> 0.4", runtime: false},
      {:ex_doc, "~> 0.11", only: :dev},
-     {:muontrap, "~> 1.0"}
+     
+     ## netif doesn't seem to work with later versions of muontrap
+     {:muontrap, "~> 1.0.0"}
     ]
   end
 end
