@@ -41,6 +41,9 @@
 #include <linux/sockios.h>
 #include <linux/ethtool.h>
 #include <netinet/in.h>
+#include <netpacket/packet.h>
+#include <linux/mii.h>
+
 
 // In Ubuntu 16.04, it seems that the new compat logic handling is preventing
 // IFF_LOWER_UP from being defined properly. It looks like a bug, so define it
@@ -94,6 +97,19 @@ struct netif {
 struct netif_link_settings {
   __u32 speed;
   __u8  duplex;
+};
+
+//ARP frame construction
+struct arp_header {
+    uint16_t htype;
+    uint16_t ptype;
+    uint8_t hlen;
+    uint8_t plen;
+    uint16_t oper;
+    uint8_t sha[6];
+    uint8_t spa[4];
+    uint8_t tha[6];
+    uint8_t tpa[4];
 };
 
 static void netif_init(struct netif *nb)
@@ -638,6 +654,72 @@ static void netif_set_ifflags(struct netif *nb,
     }
     erlcmd_encode_ok(nb->resp, &nb->resp_index);
     send_response(nb);
+}
+
+// Get interface IPv4 address
+static int get_interface_ipv4(int sock, const char *ifname, struct in_addr *out_addr) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    if (ioctl(sock, SIOCGIFADDR, &ifr) < 0)
+        return -1;
+    *out_addr = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+    return 0;
+}
+
+// Get interface MAC address
+static int get_interface_mac(int sock, const char *ifname, unsigned char *mac_out) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0)
+        return -1;
+    memcpy(mac_out, ifr.ifr_hwaddr.sa_data, 6);
+    return 0;
+}
+
+// Build an ARP request frame
+static void build_arp_request(
+    struct arp_header *arp,
+    const unsigned char *src_mac,
+    const struct in_addr *src_ip,
+    const struct in_addr *target_ip
+) {
+    arp->htype = htons(1);
+    arp->ptype = htons(0x0800);
+    arp->hlen  = 6;
+    arp->plen  = 4;
+    arp->oper  = htons(1); // ARP request
+    memcpy(arp->sha, src_mac, 6);
+    memcpy(arp->spa, &src_ip->s_addr, 4);
+    memset(arp->tha, 0x00, 6);
+    memcpy(arp->tpa, &target_ip->s_addr, 4);
+}
+
+// PHY restart (autonegotiation)
+static int phy_restart(int sock, const char *ifname) {
+    struct ifreq ifr;
+    struct mii_ioctl_data *mii = (struct mii_ioctl_data *)&ifr.ifr_data;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    // Get PHY address
+    if (ioctl(sock, SIOCGMIIPHY, &ifr) < 0)
+        return -1;
+
+    // Read BMCR (control register 0)
+    mii->reg_num = 0; // MII_BMCR
+    if (ioctl(sock, SIOCGMIIREG, &ifr) < 0)
+        return -1;
+
+    unsigned int bmcr = mii->val_out;
+    bmcr |= (1 << 9); // BMCR_ANRESTART
+
+    mii->val_in = bmcr;
+    if (ioctl(sock, SIOCSMIIREG, &ifr) < 0)
+        return -1;
+
+    return 0;
 }
 
 static int collect_route_attrs(const struct nlattr *attr, void *data)
@@ -2282,37 +2364,125 @@ static void netif_handle_set(struct netif *nb,
 
 static void netif_handle_arp(struct netif *nb, const char *ifname, const char *ip)
 {
-    char cmdline[256] = {'\0', };
-    int ret = 0;
-
     start_response(nb);
-    snprintf(cmdline, sizeof(cmdline), "arping -I %s -c 1 %s > /dev/null 2>&1", ifname, ip);
-    ret = system(cmdline);
-    if (ret == 0) {
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+    if (sock < 0) {
+        nb->last_error = errno;
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+
+    unsigned char src_mac[6];
+    if (get_interface_mac(sock, ifname, src_mac) < 0) {
+        nb->last_error = errno;
+        close(sock);
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+
+    int ifindex = ifname_to_index(nb, ifname);
+    if (ifindex < 0) {
+        nb->last_error = errno;
+        close(sock);
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+
+    struct in_addr src_ip, target_ip;
+    if (get_interface_ipv4(sock, ifname, &src_ip) < 0) {
+        nb->last_error = errno;
+        close(sock);
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+    if (inet_pton(AF_INET, ip, &target_ip) != 1) {
+        nb->last_error = EINVAL;
+        close(sock);
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+
+    unsigned char frame[42];
+    memset(frame, 0, sizeof(frame));
+    memset(frame, 0xFF, 6); // dst MAC broadcast
+    memcpy(frame + 6, src_mac, 6); // src MAC
+    *(unsigned short*)(frame + 12) = htons(ETH_P_ARP);
+
+    build_arp_request((struct arp_header*)(frame + 14), src_mac, &src_ip, &target_ip);
+
+    struct sockaddr_ll addr = {0};
+    addr.sll_family = AF_PACKET;
+    addr.sll_ifindex = ifindex;
+    addr.sll_halen = 6;
+    memset(addr.sll_addr, 0xFF, 6);
+
+    // Send ARP request
+    ssize_t sent = sendto(sock, frame, sizeof(frame), 0, (struct sockaddr*)&addr, sizeof(addr));
+    close(sock);
+    if (sent < 0) {
+        nb->last_error = errno;
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+    } else {
         nb->last_error = 0;
         erlcmd_encode_ok(nb->resp, &nb->resp_index);
-    } else {
-        nb->last_error = errno ? errno : EIO;
-        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
     }
     send_response(nb);
 }
 
 static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
 {
-    char cmdline[256] = {'\0', };
-    int ret = 0;
-
     start_response(nb);
-    snprintf(cmdline, sizeof(cmdline), "mii-tool --restart %s > /dev/null 2>&1", ifname);
-    ret = system(cmdline);
-    if (ret == 0) {
-        nb->last_error = 0;
-        erlcmd_encode_ok(nb->resp, &nb->resp_index);
-    } else {
-        nb->last_error = errno ? errno : EIO;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        nb->last_error = errno;
         erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
     }
+
+    struct ifreq ifr;
+    struct mii_ioctl_data *mii = (struct mii_ioctl_data *)&ifr.ifr_data;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    // Get PHY address
+    if (ioctl(sock, SIOCGMIIPHY, &ifr) < 0) {
+        nb->last_error = errno;
+        close(sock);
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+
+    // Read BMCR (control register 0)
+    mii->reg_num = 0; // MII_BMCR
+    if (ioctl(sock, SIOCGMIIREG, &ifr) < 0) {
+        nb->last_error = errno;
+        close(sock);
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+
+    unsigned int bmcr = mii->val_out;
+    bmcr |= (1 << 9); // BMCR_ANRESTART
+    mii->val_in = bmcr;
+    if (ioctl(sock, SIOCSMIIREG, &ifr) < 0) {
+        nb->last_error = errno;
+        close(sock);
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+        send_response(nb);
+        return;
+    }
+
+    close(sock);
+    nb->last_error = 0;
+    erlcmd_encode_ok(nb->resp, &nb->resp_index);
     send_response(nb);
 }
 
