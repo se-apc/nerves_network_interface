@@ -2280,6 +2280,42 @@ static void netif_handle_set(struct netif *nb,
   send_response(nb);
 }
 
+static void netif_handle_arp(struct netif *nb, const char *ifname, const char *ip)
+{
+    char cmdline[256] = {'\0', };
+    int ret = 0;
+
+    start_response(nb);
+    snprintf(cmdline, sizeof(cmdline), "arping -I %s -c 1 %s > /dev/null 2>&1", ifname, ip);
+    ret = system(cmdline);
+    if (ret == 0) {
+        nb->last_error = 0;
+        erlcmd_encode_ok(nb->resp, &nb->resp_index);
+    } else {
+        nb->last_error = errno ? errno : EIO;
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+    }
+    send_response(nb);
+}
+
+static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
+{
+    char cmdline[256] = {'\0', };
+    int ret = 0;
+
+    start_response(nb);
+    snprintf(cmdline, sizeof(cmdline), "mii-tool --restart %s > /dev/null 2>&1", ifname);
+    ret = system(cmdline);
+    if (ret == 0) {
+        nb->last_error = 0;
+        erlcmd_encode_ok(nb->resp, &nb->resp_index);
+    } else {
+        nb->last_error = errno ? errno : EIO;
+        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
+    }
+    send_response(nb);
+}
+
 static void netif_request_handler(const char *req, void *cookie)
 {
     struct netif *nb = (struct netif *) cookie;
@@ -2319,6 +2355,10 @@ static void netif_request_handler(const char *req, void *cookie)
             errx(EXIT_FAILURE, "ifdown requires ifname");
         debug("ifdown: %s", ifname);
         netif_set_ifflags(nb, ifname, 0, IFF_UP);
+    } else if (strcmp(cmd, "phy_restart") == 0) {
+        if (erlcmd_decode_string(nb->req, &nb->req_index, ifname, IFNAMSIZ) < 0)
+            errx(EXIT_FAILURE, "phy_restart requires ifname");
+        netif_handle_phy_restart(nb, ifname);
     } else if (strcmp(cmd, "setup") == 0) {
         if (ei_decode_tuple_header(nb->req, &nb->req_index, &arity) < 0 ||
                 arity != 2 ||
@@ -2333,6 +2373,16 @@ static void netif_request_handler(const char *req, void *cookie)
             errx(EXIT_FAILURE, "settings requires ifname");
         debug("get: %s", ifname);
         netif_handle_get(nb, ifname);
+    } else if (strcmp(cmd, "arp") == 0) {
+        if (ei_decode_tuple_header(nb->req, &nb->req_index, &arity) < 0 || arity != 2 ||
+            erlcmd_decode_string(nb->req, &nb->req_index, ifname, IFNAMSIZ) < 0) {
+            errx(EXIT_FAILURE, "arp requires {ifname, ip}");
+        }
+        char ip[INET_ADDRSTRLEN] = {0};
+        if (erlcmd_decode_string(nb->req, &nb->req_index, ip, sizeof(ip)) < 0) {
+            errx(EXIT_FAILURE, "arp requires ip string");
+        }
+        netif_handle_arp(nb, ifname, ip);
     } else
         errx(EXIT_FAILURE, "unknown command: %s", cmd);
 }

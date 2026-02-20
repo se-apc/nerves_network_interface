@@ -96,6 +96,16 @@ defmodule Nerves.NetworkInterface.Worker do
     GenServer.call(__MODULE__, {:ifdown, ifname})
   end
 
+  @spec arp(ifname, String.t()) :: :ok | {:error, term}
+  def arp(ifname, ip) do
+    GenServer.call(__MODULE__, {:arp, ifname, ip})
+  end
+
+  @spec phy_restart(ifname) :: :ok | {:error, term}
+  def phy_restart(ifname) do
+    GenServer.call(__MODULE__, {:phy_restart, ifname})
+  end
+
   @type ip_address :: binary
 
   @typedoc "Interface settings"
@@ -131,7 +141,7 @@ defmodule Nerves.NetworkInterface.Worker do
 
   # Returns list of interfaces to be managed by Nerves.NetworkInterface and Nerves.Network modules
   # By default this is list of ALL network interfaces available in the system. It can be reduced
-  # by specifying a list of interfaces we want to be managed by Nerves.Network sub-system in the 
+  # by specifying a list of interfaces we want to be managed by Nerves.Network sub-system in the
   # .../config/config.exs file.
   defp get_managed_interfaces(available_interfaces) do
     managed_interfaces = Application.get_env(:nerves_network_interface, :managed_interfaces, [])
@@ -179,6 +189,16 @@ defmodule Nerves.NetworkInterface.Worker do
   def handle_call({:settings, ifname}, _from, state) do
     response = call_port(state, :settings, ifname)
     {:reply, response, state }
+  end
+
+  def handle_call({:arp, ifname, ip}, _from, state) do
+    response = call_port(state, :arp, {ifname, ip})
+    {:reply, response, state}
+  end
+
+  def handle_call({:phy_restart, ifname}, _from, state) do
+    response = call_port(state, :phy_restart, ifname)
+    {:reply, response, state}
   end
 
   def handle_cast(:stop, state) do
