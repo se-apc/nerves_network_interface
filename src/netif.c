@@ -55,6 +55,13 @@
 #define MACADDR_STR_LEN      18 // aa:bb:cc:dd:ee:ff and a null terminator
 #define MAX_PREFIX_LEN       5  // length of "/128" (4-bytes) + length of '\0' termination string
 
+#define ARP_MAC_ADDR_LEN 6
+#define ARP_IP_ADDR_LEN 4
+#define ARP_FRAME_LEN 42
+
+#define BMCR_ANRESTART_BIT 9
+#define MII_BMCR_REG 0
+
 #include "erlcmd.h"
 
 #include "debug.h"
@@ -106,10 +113,10 @@ struct arp_header {
     uint8_t hlen;
     uint8_t plen;
     uint16_t oper;
-    uint8_t sha[6];
-    uint8_t spa[4];
-    uint8_t tha[6];
-    uint8_t tpa[4];
+    uint8_t sha[ARP_MAC_ADDR_LEN];
+    uint8_t spa[ARP_IP_ADDR_LEN];
+    uint8_t tha[ARP_MAC_ADDR_LEN];
+    uint8_t tpa[ARP_IP_ADDR_LEN];
 };
 
 static void netif_init(struct netif *nb)
@@ -2373,7 +2380,7 @@ static void netif_handle_arp(struct netif *nb, const char *ifname, const char *i
         return;
     }
 
-    unsigned char src_mac[6];
+    unsigned char src_mac[ARP_MAC_ADDR_LEN];
     if (get_interface_mac(sock, ifname, src_mac) < 0) {
         nb->last_error = errno;
         close(sock);
@@ -2407,19 +2414,19 @@ static void netif_handle_arp(struct netif *nb, const char *ifname, const char *i
         return;
     }
 
-    unsigned char frame[42];
+    unsigned char frame[ARP_FRAME_LEN];
     memset(frame, 0, sizeof(frame));
-    memset(frame, 0xFF, 6); // dst MAC broadcast
-    memcpy(frame + 6, src_mac, 6); // src MAC
-    *(unsigned short*)(frame + 12) = htons(ETH_P_ARP);
+    memset(frame, 0xFF, ARP_MAC_ADDR_LEN); // dst MAC broadcast
+    memcpy(frame + ARP_MAC_ADDR_LEN, src_mac, ARP_MAC_ADDR_LEN); // src MAC
+    *(unsigned short*)(frame + 2 * ARP_MAC_ADDR_LEN) = htons(ETH_P_ARP);
 
     build_arp_request((struct arp_header*)(frame + 14), src_mac, &src_ip, &target_ip);
 
     struct sockaddr_ll addr = {0};
     addr.sll_family = AF_PACKET;
     addr.sll_ifindex = ifindex;
-    addr.sll_halen = 6;
-    memset(addr.sll_addr, 0xFF, 6);
+    addr.sll_halen = ARP_MAC_ADDR_LEN;
+    memset(addr.sll_addr, 0xFF, ARP_MAC_ADDR_LEN);
 
     // Send ARP request
     ssize_t sent = sendto(sock, frame, sizeof(frame), 0, (struct sockaddr*)&addr, sizeof(addr));
@@ -2460,7 +2467,7 @@ static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
     }
 
     // Read BMCR (control register 0)
-    mii->reg_num = 0; // MII_BMCR
+    mii->reg_num = MII_BMCR_REG; // MII_BMCR
     if (ioctl(sock, SIOCGMIIREG, &ifr) < 0) {
         nb->last_error = errno;
         close(sock);
@@ -2470,7 +2477,7 @@ static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
     }
 
     unsigned int bmcr = mii->val_out;
-    bmcr |= (1 << 9); // BMCR_ANRESTART
+    bmcr |= (1 << BMCR_ANRESTART_BIT); // BMCR_ANRESTART
     mii->val_in = bmcr;
     if (ioctl(sock, SIOCSMIIREG, &ifr) < 0) {
         nb->last_error = errno;
