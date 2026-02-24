@@ -136,6 +136,18 @@ defmodule Nerves.NetworkInterface do
   defdelegate ifdown(ifname), to: Nerves.NetworkInterface.Worker
 
   @doc """
+  Send an ARP request to a given IP on an interface.
+  Returns `:ok` on success or `{:error, reason}` if an error occurs.
+  """
+  defdelegate arp(ifname, ip), to: Nerves.NetworkInterface.Worker
+
+  @doc """
+  Restart the PHY (link renegotiation) on the given interface.
+  Returns `:ok` on success or `{:error, reason}` if an error occurs.
+  """
+  defdelegate phy_restart(ifname), to: Nerves.NetworkInterface.Worker
+
+  @doc """
   Return the IP configuration for the specified interface as a map. See
   `setup/3` for options.
 
