@@ -60,6 +60,7 @@
 #define ARP_FRAME_LEN 42
 
 #define BMCR_ANRESTART_BIT 9
+#define BMCR_ANENABLE_BIT 12
 #define MII_BMCR_REG 0
 
 #include "erlcmd.h"
@@ -703,31 +704,6 @@ static void build_arp_request(
     memcpy(arp->tpa, &target_ip->s_addr, 4);
 }
 
-// PHY restart (autonegotiation)
-static int phy_restart(int sock, const char *ifname) {
-    struct ifreq ifr;
-    struct mii_ioctl_data *mii = (struct mii_ioctl_data *)&ifr.ifr_data;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-
-    // Get PHY address
-    if (ioctl(sock, SIOCGMIIPHY, &ifr) < 0)
-        return -1;
-
-    // Read BMCR (control register 0)
-    mii->reg_num = 0; // MII_BMCR
-    if (ioctl(sock, SIOCGMIIREG, &ifr) < 0)
-        return -1;
-
-    unsigned int bmcr = mii->val_out;
-    bmcr |= (1 << 9); // BMCR_ANRESTART
-
-    mii->val_in = bmcr;
-    if (ioctl(sock, SIOCSMIIREG, &ifr) < 0)
-        return -1;
-
-    return 0;
-}
 
 static int collect_route_attrs(const struct nlattr *attr, void *data)
 {
@@ -2478,6 +2454,7 @@ static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
 
     unsigned int bmcr = mii->val_out;
     bmcr |= (1 << BMCR_ANRESTART_BIT); // BMCR_ANRESTART
+    bmcr |= (1 << BMCR_ANENABLE_BIT);  // BMCR_ANENABLE
     mii->val_in = bmcr;
     if (ioctl(sock, SIOCSMIIREG, &ifr) < 0) {
         nb->last_error = errno;
