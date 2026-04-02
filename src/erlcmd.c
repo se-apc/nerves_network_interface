@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdint.h>
+
 
 /**
  * Initialize an Erlang command handler.
@@ -176,6 +178,46 @@ int erlcmd_decode_atom(const char *buf, int *index, char *dest, int maxlength)
         return -1;
 
     return ei_decode_atom(buf, index, dest);
+}
+
+int erlcmd_decode_uint(const char *buf, int *index, unsigned long *value)
+{
+    int type;
+    int size;
+
+    /* First inspect the type without consuming */
+    if (ei_get_type(buf, index, &type, &size) < 0)
+        return -1;
+
+    switch (type) {
+    case ERL_SMALL_INTEGER_EXT:   /* Fits 0..255 */
+    case ERL_INTEGER_EXT:         /* Signed 32-bit */
+        {
+            long tmp;
+            if (ei_decode_long(buf, index, &tmp) < 0)
+                return -1;
+
+            if (tmp < 0)
+                return -1; /* Not unsigned */
+
+            *value = (unsigned long)tmp;
+            return 0;
+        }
+
+    case ERL_SMALL_BIG_EXT:
+    case ERL_LARGE_BIG_EXT:
+        {
+            /* decode big integer */
+            unsigned long tmp = 0;
+            if (ei_decode_ulong(buf, index, &tmp) < 0)
+                return -1;
+            *value = tmp;
+            return 0;
+        }
+
+    default:
+        return -1;  /* Not an integer type */
+    }
 }
 
 /**
