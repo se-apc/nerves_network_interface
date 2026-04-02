@@ -352,6 +352,74 @@ static int ethtool_gset_ioctl(struct netif *nb, const char *ifname, struct netif
     return 0;
 }
 
+/* Set ADVERTISE bitmask:
+*/
+/**
+ * @brief Set the advertised link modes for a network interface using ethtool ioctls.
+ *
+ * This function retrieves the current ethtool settings for the given network
+ * interface, enables autonegotiation, updates the advertised link mode mask,
+ * and then applies the modified configuration using the legacy ioctl-based
+ * ETHTOOL_SSET command.
+ *
+ * The function uses ETHTOOL_GSET to read current PHY settings and
+ * ETHTOOL_SSET to apply updated advertisement values. In case of errors,
+ * it logs messages and updates the @ref netif::last_error field.
+ *
+ * @param nb
+ *      Pointer to the netif structure holding the ioctl file descriptor and
+ *      error tracking fields.
+ * @param ifname
+ *      Interface name (e.g. "eth0"). Must fit within IFNAMSIZ.
+ * @param advertising
+ *      Bitmask of link modes to advertise (e.g. ADVERTISED_1000baseT_Full).
+ *       10baseT Half duplex = 0x001
+ *       10baseT Full duplex = 0x002
+ *      100baseT Half duplex = 0x004
+ *      100baseT Full duplex = 0x008
+ *     1000baseT Half duplex = 0x010
+ *     1000baseT Full duplex = 0x020
+ *     Together: 0x03f
+ *
+ * @return
+ *      0 on success, or -1 on failure. On failure, nb->last_error is set to
+ *      the corresponding errno value from ioctl().
+ */
+static int ethtool_sset_advertising_ioctl(struct netif *nb, const char *ifname, const __u32 advertising)
+{
+    struct ethtool_cmd ecmd = {0, };
+    struct ifreq ifr = {0, };
+
+    ecmd.cmd = ETHTOOL_GSET;
+
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    ifr.ifr_data = (void *) &ecmd;
+
+    /* Get current settings */
+    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
+        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+        nb->last_error = errno;
+        return -1;
+    }
+
+    /* Enable autonegotiation */
+    ecmd.autoneg = AUTONEG_ENABLE;
+
+    ecmd.advertising = advertising;
+
+    /* Apply new settings */
+    ecmd.cmd = ETHTOOL_SSET;
+
+    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
+        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_SSET", strerror(errno), ifname);
+        return -1;
+    }
+
+    debug("Advertise mask updated successfully.\n");
+
+    return 0;
+}
+
 static int netif_build_ifinfo(const struct nlmsghdr *nlh, void *data)
 {
   struct netif *nb = (struct netif *) data;
@@ -905,6 +973,8 @@ static int get_ipv6_accept_ra_pinfo(const struct ip_setting_handler *handler, st
 static int prep_ipv6_forwarding(const struct ip_setting_handler *handler, struct netif *nb, void **context);
 static int set_ipv6_forwarding(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname, void *context);
 static int get_ipv6_forwarding(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname);
+static int prep_advertised_link_modes(const struct ip_setting_handler *handler, struct netif *nb, void **context);
+static int set_advertised_link_modes(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname, void *context);
 
 
 /* These handlers are listed in the order that they should be invoked when
@@ -1018,6 +1088,13 @@ static const struct ip_setting_handler handlers[] = {
     .ioctl_set = SIOCDELRT,
     .ioctl_get = 0,
   },
+  { .name = "advertised_link_modes",
+    .prep = prep_advertised_link_modes,
+    .set  = set_advertised_link_modes,
+    .get  = NULL,
+    .ioctl_set = 0,
+    .ioctl_get = 0,
+  },
   { .name = NULL, } /* Setting-up a guard */
 };
 #define HANDLER_COUNT ((sizeof(handlers)-1) / sizeof(handlers[0])) /* -1 is for the guard at the end of the array */
@@ -1115,6 +1192,22 @@ static int prep_ipv6_forwarding(const struct ip_setting_handler *handler, struct
 
     if ( erlcmd_decode_atom(nb->req, &nb->req_index, &ac_ctx->token[0], member_size(struct ipv6_procfs_ctx, token) ) < 0)
         errx(EXIT_FAILURE, "Autoconf value true/false required for '%s'", handler->name);
+
+    return 0;
+}
+
+static int prep_advertised_link_modes(const struct ip_setting_handler *handler, struct netif *nb, void **context)
+{
+    unsigned long *link_modes = calloc(sizeof(unsigned long), 1);
+
+    if (link_modes) {
+        if (erlcmd_decode_uint(nb->req, &nb->req_index, link_modes) < 0)
+            errx(EXIT_FAILURE, "Advertised link modes parameter required for '%s'", handler->name);
+
+        debug("Decoded advertising = '0x%08x' for '%s'", *link_modes, handler->name);
+    }
+
+    *context = link_modes;
 
     return 0;
 }
@@ -1269,6 +1362,25 @@ static int set_ipv6_forwarding(const struct ip_setting_handler *handler, struct 
     }
 
     if(ipv6_write_integer_to_file(handler, nb, fname, forwarding) < 0){
+        return -1;
+    }
+
+    return 0;
+}
+
+static int set_advertised_link_modes(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname, void *context)
+{
+    if (context == NULL) {
+        debug("Bad advertising mask '%s'", handler->name);
+        nb->last_error = EINVAL;
+        return -1;
+    }
+
+    const __u32 advertising = (__u32) *((const unsigned long *) context);
+
+    if (ethtool_sset_advertising_ioctl(nb, ifname, advertising) < 0) {
+        error("Failed for setting '%s': %s", handler->name, strerror(errno));
+        nb->last_error = errno;
         return -1;
     }
 
