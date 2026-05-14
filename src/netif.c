@@ -2554,20 +2554,10 @@ static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
         return;
     }
 
-    // Read BMCR (control register 0)
+    // Write a clean BMCR: autoneg enable + restart autoneg, all speed/duplex bits cleared.
+    // Do not read-modify-write, if BMCR is in a corrupted state, don't want to preserve that.
     mii->reg_num = MII_BMCR_REG; // MII_BMCR
-    if (ioctl(sock, SIOCGMIIREG, &ifr) < 0) {
-        nb->last_error = errno;
-        close(sock);
-        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
-        send_response(nb);
-        return;
-    }
-
-    unsigned int bmcr = mii->val_out;
-    bmcr |= (1 << BMCR_ANRESTART_BIT); // BMCR_ANRESTART
-    bmcr |= (1 << BMCR_ANENABLE_BIT);  // BMCR_ANENABLE
-    mii->val_in = bmcr;
+    mii->val_in = (1 << BMCR_ANENABLE_BIT) | (1 << BMCR_ANRESTART_BIT);
     if (ioctl(sock, SIOCSMIIREG, &ifr) < 0) {
         nb->last_error = errno;
         close(sock);
