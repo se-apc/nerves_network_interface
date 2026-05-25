@@ -43,6 +43,7 @@
 #include <netinet/in.h>
 #include <netpacket/packet.h>
 #include <linux/mii.h>
+#include <linux/icmpv6.h>
 
 
 // In Ubuntu 16.04, it seems that the new compat logic handling is preventing
@@ -129,6 +130,15 @@ static void netif_init(struct netif *nb)
 
     if (mnl_socket_bind(nb->nl, RTMGRP_LINK, MNL_SOCKET_AUTOPID) < 0)
         err(EXIT_FAILURE, "mnl_socket_bind");
+
+    // Also subscribe to ND user option notifications (RDNSS/DNSSL, RFC 8106)
+#ifndef RTNLGRP_ND_USEROPT
+#define RTNLGRP_ND_USEROPT 20
+#endif
+    int nd_useropt_group = RTNLGRP_ND_USEROPT;
+    if (setsockopt(mnl_socket_get_fd(nb->nl), SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
+                   &nd_useropt_group, sizeof(nd_useropt_group)) < 0)
+        warn("setsockopt NETLINK_ADD_MEMBERSHIP RTNLGRP_ND_USEROPT failed: %s", strerror(errno));
 
     nb->nl_uevent = mnl_socket_open(NETLINK_KOBJECT_UEVENT);
     if (!nb->nl_uevent)
@@ -564,9 +574,109 @@ static void nl_uevent_process(struct netif *nb)
     }
 }
 
+// RFC 8106: ND_OPT_RDNSS = 25, ND_OPT_DNSSL = 31
+#define ND_OPT_RDNSS  25
+#define ND_OPT_DNSSL  31
+
+// Handle RTM_NEWNDUSEROPT — extract RDNSS/DNSSL and notify Elixir
+static void handle_nd_useropt(struct netif *nb, int bytecount)
+{
+    const struct nlmsghdr *nlh = (struct nlmsghdr *)nb->nlbuf;
+    const struct nduseroptmsg *ndmsg = mnl_nlmsg_get_payload(nlh);
+
+    // Resolve interface name from index
+    char ifname[IF_NAMESIZE] = "unknown";
+    if_indextoname(ndmsg->nduseropt_ifindex, ifname);
+
+    // The ND option immediately follows the nduseroptmsg header
+    const uint8_t *opt = (const uint8_t *)(ndmsg + 1);
+    int opts_len = ndmsg->nduseropt_opts_len;
+
+    while (opts_len >= 2) {
+        uint8_t opt_type = opt[0];
+        int opt_len_bytes = opt[1] * 8;
+
+        if (opt_len_bytes == 0 || opt_len_bytes > opts_len)
+            break;
+
+        if (opt_type == ND_OPT_RDNSS && opt_len_bytes >= 24) {
+            // RDNSS option: 4 bytes header + 4 bytes reserved + 4 bytes lifetime + N*16 bytes addresses
+            uint32_t lifetime;
+            memcpy(&lifetime, opt + 4, 4);
+            lifetime = ntohl(lifetime);
+
+            int num_addrs = (opt_len_bytes - 8) / 16;
+            for (int i = 0; i < num_addrs; i++) {
+                char addr_str[INET6_ADDRSTRLEN] = {0};
+                inet_ntop(AF_INET6, opt + 8 + i * 16, addr_str, sizeof(addr_str));
+
+                start_notification(nb);
+                ei_encode_tuple_header(nb->resp, &nb->resp_index, 2);
+                ei_encode_atom(nb->resp, &nb->resp_index, "ra_rdnss");
+                ei_encode_map_header(nb->resp, &nb->resp_index, 3);
+                encode_kv_string(nb, "ifname", ifname);
+                encode_kv_string(nb, "address", addr_str);
+                encode_kv_ulong(nb, "lifetime", (unsigned long)lifetime);
+                send_response(nb);
+            }
+
+        } else if (opt_type == ND_OPT_DNSSL && opt_len_bytes >= 16) {
+            // DNSSL option: 2 bytes type/len + 2 bytes reserved + 4 bytes lifetime + DNS search list
+            uint32_t lifetime;
+            memcpy(&lifetime, opt + 4, 4);
+            lifetime = ntohl(lifetime);
+
+            // Walk the DNS search list — RFC 6106 §5.3.1
+            const uint8_t *labels = opt + 8;
+            int labels_len = opt_len_bytes - 8;
+            char domain[256] = {0};
+            int d_idx = 0;
+            int l = 0;
+
+            while (l < labels_len) {
+                uint8_t label_len = labels[l++];
+                if (label_len == 0) {
+                    if (d_idx > 0) {
+                        if (domain[d_idx - 1] == '.')
+                            domain[d_idx - 1] = '\0';
+                        start_notification(nb);
+                        ei_encode_tuple_header(nb->resp, &nb->resp_index, 2);
+                        ei_encode_atom(nb->resp, &nb->resp_index, "ra_dnssl");
+                        ei_encode_map_header(nb->resp, &nb->resp_index, 3);
+                        encode_kv_string(nb, "ifname", ifname);
+                        encode_kv_string(nb, "domain", domain);
+                        encode_kv_ulong(nb, "lifetime", (unsigned long)lifetime);
+                        send_response(nb);
+                        d_idx = 0;
+                        memset(domain, 0, sizeof(domain));
+                    }
+                    continue;
+                }
+                if (l + label_len > labels_len || d_idx + label_len + 1 >= (int)sizeof(domain))
+                    break;
+                memcpy(domain + d_idx, labels + l, label_len);
+                d_idx += label_len;
+                domain[d_idx++] = '.';
+                l += label_len;
+            }
+        }
+
+        opts_len -= opt_len_bytes;
+        opt += opt_len_bytes;
+    }
+}
+
 static void handle_notification(struct netif *nb, int bytecount)
 {
     debug("[%s %d %s]: bytecount = %d\r\n", __FILE__, __LINE__, __func__, bytecount);
+
+    const struct nlmsghdr *nlh = (struct nlmsghdr *)nb->nlbuf;
+
+    // Dispatch RTM_NEWNDUSEROPT (RDNSS/DNSSL) separately
+    if (nlh->nlmsg_type == RTM_NEWNDUSEROPT) {
+        handle_nd_useropt(nb, bytecount);
+        return;
+    }
 
     // Create the notification
     start_notification(nb);
