@@ -220,6 +220,15 @@ int erlcmd_decode_uint(const char *buf, int *index, unsigned long *value)
     }
 }
 
+int erlcmd_decode_tuple_header(const char *buf, int *index, int *arity)
+{
+    int type;
+    if (ei_get_type(buf, index, &type, arity) < 0 || type != ERL_SMALL_TUPLE_EXT)
+	return -1;
+
+    return ei_decode_tuple_header(buf, index, arity);
+}
+
 /**
  * @brief Encode the atom "ok" for the common success response.
  * @param buf where to store the atom
