@@ -149,24 +149,62 @@ defmodule Nerves.NetworkInterface do
 
   @doc """
   Return the IP configuration for the specified interface as a map. See
-  `setup/3` for options.
+  `setup/2` for options.
 
   Returns `{:ok, config}` on success or `{:error, reason}` if an error occurs.
   """
   defdelegate settings(ifname), to: Nerves.NetworkInterface.Worker
 
   @doc """
-  Set IP settings for the specified interface. The following options are
-  available:
+  Apply network configuration for the specified interface.
 
-    * `:ipv4_address` - the IPv4 address of the interface
-    * `:ipv4_broadcast` - the IPv4 broadcast address for the interface
-    * `:ipv4_subnet_mask` - the IPv4 subnet mask
-    * `:ipv4_gateway` - the default gateway
+  The `options` argument can be either a keyword list or a map.
+  Only keys included in `options` are updated.
 
-  Options can be specified either as a keyword list or as a map.
+  Common IPv4 options:
 
-  Returns `:ok` on success or `{:error, reason}` if an error occurs.
+    * `:ipv4_address` - IPv4 address of the interface
+    * `:ipv4_broadcast` - IPv4 broadcast address
+    * `:ipv4_subnet_mask` - IPv4 subnet mask
+    * `:ipv4_gateway` - default IPv4 gateway (set `""` to remove)
+
+  Common IPv6 options:
+
+    * `:ipv6_disable` - enable/disable IPv6 stack
+    * `:ipv6_autoconf` - enable/disable SLAAC/autoconfiguration
+    * `:ipv6_accept_ra` - Router Advertisement policy
+    * `:ipv6_accept_ra_pinfo` - accept RA prefix info
+    * `:ipv6_address` - IPv6 address/prefix
+    * `:ipv6_gateway` - default IPv6 gateway
+    * `:"-ipv6_address"` - remove an IPv6 address
+    * `:"-ipv6_gateway"` - remove an IPv6 gateway
+
+  Ethernet link options:
+
+    * `:advertised_link_modes` - advertised mode bitmask for auto-negotiation
+    * `:link_mode` - forced mode tuple `{speed_mbps, duplex}`
+
+  ## Notes
+
+    * 1000BASE-T operation should use auto-negotiation.
+    * Calls may return temporary busy errors during early bootstrap; callers
+      should retry with bounded backoff when appropriate.
+
+  Returns `:ok` on success, or `{:error, reason}` if the request fails.
+
+  ## Examples
+
+      iex> Nerves.NetworkInterface.setup("eth0", %{ipv4_gateway: "192.168.1.1"})
+      :ok
+
+      iex> Nerves.NetworkInterface.setup("eth0", [ipv6_disable: true])
+      :ok
+
+      iex> Nerves.NetworkInterface.setup("eth0", %{advertised_link_modes: 0x02F})
+      :ok
+
+      iex> Nerves.NetworkInterface.setup("eth0", %{link_mode: {100, :full}})
+      :ok
   """
   defdelegate setup(ifname, options), to: Nerves.NetworkInterface.Worker
 

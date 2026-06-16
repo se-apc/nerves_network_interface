@@ -421,6 +421,43 @@ static int ethtool_sset_advertising_ioctl(struct netif *nb, const char *ifname, 
     return 0;
 }
 
+/* Note: This function will first retrieve the current settings using ETHTOOL_GSET, then it will disable autonegotiation, set the desired speed and duplexity, and finally apply the new settings using ETHTOOL_SSET. On failure, it will log an error message and return -1, while on success it will return 0. */
+static int ethtool_sset_speed_duplexity_ioctl(struct netif *nb, const char *ifname, const __u32 speed, const __u8 duplex)
+{
+    struct ethtool_cmd ecmd = {0, };
+    struct ifreq ifr = {0, };
+
+    ecmd.cmd = ETHTOOL_GSET;
+
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    ifr.ifr_data = (void *) &ecmd;
+
+    /* Get current settings */
+    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
+	error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+	nb->last_error = errno;
+	return -1;
+    }
+
+    /* Disable autonegotiation */
+    ecmd.autoneg = AUTONEG_DISABLE;
+
+    ecmd.speed = speed;
+    ecmd.duplex = duplex;
+
+    /* Apply new settings */
+    ecmd.cmd = ETHTOOL_SSET;
+
+    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
+	error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_SSET", strerror(errno), ifname);
+	return -1;
+    }
+
+    debug("Speed and duplexity updated successfully.\n");
+
+    return 0;
+}
+
 static int netif_build_ifinfo(const struct nlmsghdr *nlh, void *data)
 {
   struct netif *nb = (struct netif *) data;
@@ -951,6 +988,8 @@ static int set_ipv6_forwarding(const struct ip_setting_handler *handler, struct 
 static int get_ipv6_forwarding(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname);
 static int prep_advertised_link_modes(const struct ip_setting_handler *handler, struct netif *nb, void **context);
 static int set_advertised_link_modes(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname, void *context);
+static int prep_link_mode(const struct ip_setting_handler *handler, struct netif *nb, void **context);
+static int set_link_mode(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname, void *context);
 
 
 /* These handlers are listed in the order that they should be invoked when
@@ -1071,6 +1110,13 @@ static const struct ip_setting_handler handlers[] = {
     .ioctl_set = 0,
     .ioctl_get = 0,
   },
+  { .name = "link_mode",
+    .prep = prep_link_mode,
+    .set  = set_link_mode,
+    .get  = NULL,
+    .ioctl_set = 0,
+    .ioctl_get = 0,
+  },
   { .name = NULL, } /* Setting-up a guard */
 };
 #define HANDLER_COUNT ((sizeof(handlers)-1) / sizeof(handlers[0])) /* -1 is for the guard at the end of the array */
@@ -1184,6 +1230,34 @@ static int prep_advertised_link_modes(const struct ip_setting_handler *handler, 
     }
 
     *context = link_modes;
+
+    return 0;
+}
+
+struct link_mode_ctx {
+    unsigned long speed;
+    char duplex[10];
+    int tuple_arity;
+};
+
+static int prep_link_mode(const struct ip_setting_handler *handler, struct netif *nb, void **context)
+{
+    struct link_mode_ctx *lm_ctx = *context = malloc(sizeof(struct link_mode_ctx));
+
+    if(*context == NULL) {
+	errx(EXIT_FAILURE, "Unable to allocate memory for '%s'", handler->name);
+    }
+
+    if (erlcmd_decode_tuple_header(nb->req, &nb->req_index, &lm_ctx->tuple_arity) < 0 || lm_ctx->tuple_arity != 2)
+	errx(EXIT_FAILURE, "A tuple of {Speed, Duplex} is required for '%s'", handler->name);
+
+    if (erlcmd_decode_uint(nb->req, &nb->req_index, &lm_ctx->speed) < 0)
+	errx(EXIT_FAILURE, "Speed parameter required for '%s'", handler->name);
+
+    if (erlcmd_decode_atom(nb->req, &nb->req_index, &lm_ctx->duplex[0], sizeof(lm_ctx->duplex)) < 0)
+	errx(EXIT_FAILURE, "Duplex parameter required for '%s'", handler->name);
+
+    debug("Decoded speed = '%u', duplex = '%s' for '%s'", lm_ctx->speed, lm_ctx->duplex, handler->name);
 
     return 0;
 }
@@ -1358,6 +1432,38 @@ static int set_advertised_link_modes(const struct ip_setting_handler *handler, s
         error("Failed for setting '%s': %s", handler->name, strerror(errno));
         nb->last_error = errno;
         return -1;
+    }
+
+    return 0;
+}
+
+static int set_link_mode(const struct ip_setting_handler *handler, struct netif *nb, const char *ifname, void *context)
+{
+    if (context == NULL) {
+	debug("Bad speed/duplexity value '%s'", handler->name);
+	nb->last_error = EINVAL;
+	return -1;
+    }
+
+    const struct link_mode_ctx *lm = (const struct link_mode_ctx *) context;
+    debug("Setting speed = '%u', duplex = '%s' for '%s'", lm->speed, lm->duplex, handler->name);
+
+    __u8 duplex = DUPLEX_FULL;
+    if(strncmp(lm->duplex, "full", sizeof(lm->duplex)) == 0) {
+	duplex = DUPLEX_FULL;
+    }
+    else if(strncmp(lm->duplex, "half", sizeof(lm->duplex)) == 0) {
+	duplex = DUPLEX_HALF;
+    }
+    else {
+	error("Bad duplexity value '%s' for '%s'", lm->duplex, handler->name);
+	nb->last_error = EINVAL;
+	return -1;
+    }
+    if (ethtool_sset_speed_duplexity_ioctl(nb, ifname, lm->speed, duplex) < 0) {
+	error("Failed for setting '%s': %s", handler->name, strerror(errno));
+	nb->last_error = errno;
+	return -1;
     }
 
     return 0;
@@ -2414,12 +2520,12 @@ static void netif_handle_set(struct netif *nb,
     // the caller can pass in maps that contain options for other code.
     handler = (struct ip_setting_handler *) find_handler(name);
 
-    debug("%s %d]: handler for '%s' = %p\r\n", __FILE__, __LINE__, name, (void *) handler);
+    debug("[%s %d]: handler for '%s' = %p\r\n", __FILE__, __LINE__, name, (void *) handler);
 
     if (handler != NULL) {
       handler->prep(handler, nb, &handler_context[handler - handlers]);
     } else {
-      debug("%s %d]: No known handler for '%s' = %p! Skipping term...\r\n", __FILE__, __LINE__, name, (void *) handler);
+      debug("[%s %d]: No known handler for '%s' = %p! Skipping term...\r\n", __FILE__, __LINE__, name, (void *) handler);
       ei_skip_term(nb->req, &nb->req_index);
     }
   }
