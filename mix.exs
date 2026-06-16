@@ -44,7 +44,7 @@ defmodule Nerves.NetworkInterface.Mixfile do
      {:ex_doc, "~> 0.11", only: :dev},
      
      ## netif doesn't seem to work with later versions of muontrap
-     {:muontrap, "~> 1.0.0"}
+     {:muontrap, "~> 1.5"}
     ]
   end
 end
