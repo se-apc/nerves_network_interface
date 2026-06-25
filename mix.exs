@@ -43,8 +43,7 @@ defmodule Nerves.NetworkInterface.Mixfile do
      {:elixir_make, "~> 0.4", runtime: false},
      {:ex_doc, "~> 0.11", only: :dev},
      
-     ## netif doesn't seem to work with later versions of muontrap
-     {:muontrap, "~> 1.5"}
+     {:muontrap, github: "se-apc/muontrap", branch: "main"}
     ]
   end
 end

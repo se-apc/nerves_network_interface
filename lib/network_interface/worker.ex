@@ -131,9 +131,32 @@ defmodule Nerves.NetworkInterface.Worker do
   def init([]) do
     Logger.warning "Start Network Interface Worker"
     executable = :code.priv_dir(:nerves_network_interface) ++ '/netif'
-    port = Port.open({:spawn_executable, to_charlist(MuonTrap.muontrap_path())},
-    [{:args, ["--", executable]}, {:packet, 2}, :use_stdio, :binary])
-    { :ok, %Nerves.NetworkInterface.Worker{port: port} }
+    muontrap_path = MuonTrap.muontrap_path()
+
+    args =
+      if muontrap_supports_option?(muontrap_path, "--passthrough-stdio") do
+        ["--passthrough-stdio", "--", executable]
+      else
+        Logger.warning("MuonTrap does not support --passthrough-stdio. Using capture-output fallback.")
+        ["--capture-output", "--capture-stderr", "--", executable]
+      end
+
+    port =
+      Port.open({:spawn_executable, to_charlist(muontrap_path)},
+        [{:args, args}, {:packet, 2}, :use_stdio, :binary]
+      )
+
+    {:ok, %Nerves.NetworkInterface.Worker{port: port}}
+  end
+
+  defp muontrap_supports_option?(muontrap_path, option) do
+    case System.cmd(to_string(muontrap_path), ["--help"], stderr_to_stdout: true) do
+      {output, _exit_code} ->
+        String.contains?(output, option)
+    end
+  rescue
+    _ ->
+      false
   end
 
   #Returns intersection of lists a and b
@@ -247,6 +270,12 @@ defmodule Nerves.NetworkInterface.Worker do
     receive do
       {_, {:data, <<?r, response::binary>>}} ->
         :erlang.binary_to_term(response)
+
+      {_, {:exit_status, status}} ->
+        {:error, {:port_exit, status}}
+
+      {_, :closed} ->
+        {:error, :port_closed}
     after
       4_000 ->
         # Not sure how this can be recovered
