@@ -2635,15 +2635,33 @@ static void netif_handle_arp(struct netif *nb, const char *ifname, const char *i
     send_response(nb);
 }
 
-static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
+static int ethtool_nway_restart_ioctl(struct netif *nb, const char *ifname)
 {
-    start_response(nb);
+    struct ifreq ifr;
+    struct ethtool_value eval;
+
+    memset(&ifr, 0, sizeof(ifr));
+    memset(&eval, 0, sizeof(eval));
+
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    eval.cmd = ETHTOOL_NWAY_RST;
+    ifr.ifr_data = (void *) &eval;
+
+    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
+        nb->last_error = errno;
+        return -1;
+    }
+
+    nb->last_error = 0;
+    return 0;
+}
+
+static int mii_phy_restart_ioctl(struct netif *nb, const char *ifname)
+{
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         nb->last_error = errno;
-        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
-        send_response(nb);
-        return;
+        return -1;
     }
 
     struct ifreq ifr;
@@ -2651,30 +2669,47 @@ static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
 
-    // Get PHY address
     if (ioctl(sock, SIOCGMIIPHY, &ifr) < 0) {
         nb->last_error = errno;
         close(sock);
-        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
-        send_response(nb);
-        return;
+        return -1;
     }
 
     // Write a clean BMCR: autoneg enable + restart autoneg, all speed/duplex bits cleared.
-    // Do not read-modify-write, if BMCR is in a corrupted state, don't want to preserve that.
-    mii->reg_num = MII_BMCR_REG; // MII_BMCR
+    mii->reg_num = MII_BMCR_REG;
     mii->val_in = (1 << BMCR_ANENABLE_BIT) | (1 << BMCR_ANRESTART_BIT);
+
     if (ioctl(sock, SIOCSMIIREG, &ifr) < 0) {
         nb->last_error = errno;
         close(sock);
-        erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
-        send_response(nb);
-        return;
+        return -1;
     }
 
     close(sock);
     nb->last_error = 0;
-    erlcmd_encode_ok(nb->resp, &nb->resp_index);
+    return 0;
+}
+
+static void netif_handle_phy_restart(struct netif *nb, const char *ifname)
+{
+    start_response(nb);
+
+    if (ethtool_nway_restart_ioctl(nb, ifname) == 0) {
+        erlcmd_encode_ok(nb->resp, &nb->resp_index);
+        send_response(nb);
+        return;
+    }
+
+    // Keep compatibility for drivers that do not support ETHTOOL_NWAY_RST.
+    if (nb->last_error == EOPNOTSUPP || nb->last_error == ENOTTY || nb->last_error == EINVAL) {
+        if (mii_phy_restart_ioctl(nb, ifname) == 0) {
+            erlcmd_encode_ok(nb->resp, &nb->resp_index);
+            send_response(nb);
+            return;
+        }
+    }
+
+    erlcmd_encode_errno_error(nb->resp, &nb->resp_index, nb->last_error);
     send_response(nb);
 }
 
