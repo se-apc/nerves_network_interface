@@ -81,17 +81,17 @@ defmodule Nerves.NetworkInterface.Worker do
     stats: stats
   }
 
-  @spec status(ifname) :: {:ok, status}
+  @spec status(ifname) :: {:ok, status} | {:error, term}
   def status(ifname) do
     GenServer.call(__MODULE__, {:status, ifname})
   end
 
-  @spec ifup(ifname) :: :ok
+  @spec ifup(ifname) :: :ok | {:error, term}
   def ifup(ifname) do
     GenServer.call(__MODULE__, {:ifup, ifname})
   end
 
-  @spec ifdown(ifname) :: :ok
+  @spec ifdown(ifname) :: :ok | {:error, term}
   def ifdown(ifname) do
     GenServer.call(__MODULE__, {:ifdown, ifname})
   end
@@ -114,12 +114,12 @@ defmodule Nerves.NetworkInterface.Worker do
                       ipv4_gateway: ip_address,
                       ipv4_subnet_mask: ip_address}
 
-  @spec settings(ifname) :: {:ok, settings}
+  @spec settings(ifname) :: {:ok, settings} | {:error, term}
   def settings(ifname) do
     GenServer.call(__MODULE__, {:settings, ifname})
   end
 
-  @spec setup(ifname, Keyword.t | options) :: :ok
+  @spec setup(ifname, Keyword.t | options) :: :ok | {:error, term}
   def setup(ifname, options) when is_list(options) do
     setup(ifname, :maps.from_list(options))
   end
