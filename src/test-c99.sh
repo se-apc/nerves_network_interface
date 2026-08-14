@@ -1,6 +1,6 @@
 #!/bin/sh
 
-if [ -z $CC ]; then
+if [ -z "$CC" ]; then
   CC=cc
 fi
 
