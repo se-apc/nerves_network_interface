@@ -37,6 +37,7 @@ ERL_LDFLAGS ?= -L$(ERL_EI_LIBDIR) -lei
 
 LDFLAGS += -lmnl
 CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -pedantic
+CFLAGS += -fPIC
 
 
 # Unfortunately, depending on the system we're on, we need
@@ -44,7 +45,7 @@ CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -pedantic
 # but it fails to build on many setups.
 # NOTE: Need to call sh here since file permissions are not preserved
 #       in hex packages.
-ifeq ($(shell CC=$(CC) sh src/test-c99.sh),yes)
+ifeq ($(shell CC="$(CC)" sh src/test-c99.sh),yes)
 CFLAGS += -std=c99 -D_XOPEN_SOURCE=600
 else
 CFLAGS += -std=gnu99
@@ -67,13 +68,15 @@ endif
 all: $(DEFAULT_TARGETS)
 
 %.o: %.c
-	$(CC) -c $(ERL_CFLAGS) $(CFLAGS) -o $@ $<
+	# Force PIC to prevent ARM relocation errors seen with newer Scarthgap toolchains.
+	$(CC) -fPIC -c $(ERL_CFLAGS) $(CFLAGS) -o $@ $<
 
 priv:
 	mkdir -p priv
 
 priv/netif: src/erlcmd.o src/netif.o
-	$(CC) $^ $(ERL_LDFLAGS) $(LDFLAGS) -o $@
+    # Deterministic link line: explicit EI/mnl libs and only linker-style flags from LDFLAGS.
+	$(CC) $^ -L$(ERL_EI_LIBDIR) -lei -lmnl $(filter -Wl%,$(LDFLAGS)) -o $@
 	# setuid root net_basic so that it can configure network interfaces
 	SUDO_ASKPASS=$(SUDO_ASKPASS) $(SUDO) -- sh -c 'chown root:root $@; chmod +s $@'
 
