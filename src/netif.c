@@ -374,6 +374,20 @@ static struct ethtool_link_settings *alloc_link_ksettings(int nwords)
     return (struct ethtool_link_settings *) calloc(1, size);
 }
 
+static int should_suppress_bootstrap_ebusy(const struct netif *nb, int err)
+{
+    time_t now;
+    double since_init_sec;
+
+    if (err != EBUSY)
+        return 0;
+
+    now = time(NULL);
+    since_init_sec = difftime(now, nb->init_time);
+
+    return since_init_sec >= 0 && since_init_sec <= STATUS_EBUSY_SUPPRESS_WINDOW_SEC;
+}
+
 static int ethtool_glinksettings_get_ioctl(struct netif *nb, int fd, const char *ifname,
                                            struct ethtool_link_settings **out)
 {
@@ -442,7 +456,13 @@ static int ethtool_gset_legacy_ioctl(struct netif *nb, int fd, const char *ifnam
 
     if (ethtool_ioctl_retry(fd, &ifr) < 0) {
         nb->last_error = errno;
-        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+        if (should_suppress_bootstrap_ebusy(nb, errno)) {
+            debug("ioctl(0x%04x) failed for getting '%s': %s for %s (suppressed during bootstrap)",
+                  SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+        } else {
+            error("ioctl(0x%04x) failed for getting '%s': %s for %s",
+                  SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+        }
         return -1;
     }
 
@@ -465,8 +485,14 @@ static int ethtool_sset_advertising_legacy_ioctl(struct netif *nb, int fd, const
 
     /* Get current settings */
     if (ethtool_ioctl_retry(fd, &ifr) < 0) {
-        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
         nb->last_error = errno;
+        if (should_suppress_bootstrap_ebusy(nb, errno)) {
+            debug("ioctl(0x%04x) failed for getting '%s': %s for %s (suppressed during bootstrap)",
+                  SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+        } else {
+            error("ioctl(0x%04x) failed for getting '%s': %s for %s",
+                  SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+        }
         return -1;
     }
 
@@ -1670,8 +1696,13 @@ static int set_advertised_link_modes(const struct ip_setting_handler *handler, s
     const __u32 advertising = (__u32) *((const unsigned long *) context);
 
     if (ethtool_sset_advertising_ioctl(nb, ifname, advertising) < 0) {
-        error("Failed for setting '%s': %s", handler->name, strerror(errno));
         nb->last_error = errno;
+        if (should_suppress_bootstrap_ebusy(nb, errno)) {
+            debug("Failed for setting '%s': %s (suppressed during bootstrap)",
+                  handler->name, strerror(errno));
+        } else {
+            error("Failed for setting '%s': %s", handler->name, strerror(errno));
+        }
         return -1;
     }
 
