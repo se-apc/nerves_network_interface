@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -62,10 +63,19 @@
 #define BMCR_ANRESTART_BIT 9
 #define BMCR_ANENABLE_BIT 12
 #define MII_BMCR_REG 0
+#define ETHTOOL_IOCTL_EBUSY_RETRIES 5
+#define ETHTOOL_IOCTL_EBUSY_RETRY_DELAY_US 50000
+#define STATUS_EBUSY_SUPPRESS_WINDOW_SEC 120
 
 #include "erlcmd.h"
 
 #include "debug.h"
+
+/* Temporary dual logging for ethtool flow tracing. */
+#define flow_debug(fmt, ...) \
+    do { \
+        debug(fmt, ##__VA_ARGS__); \
+    } while (0)
 
 struct netif {
     // NETLINK_ROUTE socket information
@@ -100,6 +110,11 @@ struct netif {
 
     // Holder of the most recently encounted errno.
     int last_error;
+    
+    // Origin of netif_build_ifinfo invocation for debugging GSET failures
+    const char *ifinfo_origin;
+    time_t init_time;
+    int status_ebusy_suppression_noted;
 };
 
 struct netif_link_settings {
@@ -123,6 +138,9 @@ struct arp_header {
 static void netif_init(struct netif *nb)
 {
     memset(nb, 0, sizeof(*nb));
+    nb->ifinfo_origin = "unknown";
+    nb->init_time = time(NULL);
+    
     nb->nl = mnl_socket_open(NETLINK_ROUTE);
     if (!nb->nl)
         err(EXIT_FAILURE, "mnl_socket_open (NETLINK_ROUTE)");
@@ -331,7 +349,88 @@ static void encode_kv_operstate(struct netif *nb, int operstate)
     ei_encode_atom(nb->resp, &nb->resp_index, operstate_atom);
 }
 
-static int ethtool_gset_ioctl(struct netif *nb, const char *ifname, struct netif_link_settings *ls)
+static int ethtool_ioctl_retry(int fd, struct ifreq *ifr)
+{
+    int attempt;
+
+    for (attempt = 0; attempt <= ETHTOOL_IOCTL_EBUSY_RETRIES; attempt++) {
+        if (ioctl(fd, SIOCETHTOOL, ifr) == 0)
+            return 0;
+
+        if (errno != EBUSY || attempt == ETHTOOL_IOCTL_EBUSY_RETRIES)
+            return -1;
+
+        usleep(ETHTOOL_IOCTL_EBUSY_RETRY_DELAY_US);
+    }
+
+    errno = EBUSY;
+    return -1;
+}
+
+static struct ethtool_link_settings *alloc_link_ksettings(int nwords)
+{
+    size_t words = (size_t) nwords * 3;
+    size_t size = sizeof(struct ethtool_link_settings) + words * sizeof(__u32);
+    return (struct ethtool_link_settings *) calloc(1, size);
+}
+
+static int ethtool_glinksettings_get_ioctl(struct netif *nb, int fd, const char *ifname,
+                                           struct ethtool_link_settings **out)
+{
+    struct ethtool_link_settings probe = {0, };
+    struct ifreq ifr = {0, };
+    int nwords;
+    struct ethtool_link_settings *settings;
+
+    probe.cmd = ETHTOOL_GLINKSETTINGS;
+    probe.link_mode_masks_nwords = 0;
+    flow_debug("ethtool(%s): trying ETHTOOL_GLINKSETTINGS probe", ifname);
+
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    ifr.ifr_data = (void *) &probe;
+
+    if (ethtool_ioctl_retry(fd, &ifr) < 0) {
+        nb->last_error = errno;
+        flow_debug("ethtool(%s): GLINKSETTINGS probe failed errno=%d (%s)", ifname, errno, strerror(errno));
+        return -1;
+    }
+
+    nwords = probe.link_mode_masks_nwords;
+    if (nwords < 0)
+        nwords = -nwords;
+
+    if (nwords <= 0) {
+        nb->last_error = EINVAL;
+        errno = EINVAL;
+        flow_debug("ethtool(%s): GLINKSETTINGS invalid nwords=%d", ifname, nwords);
+        return -1;
+    }
+    flow_debug("ethtool(%s): GLINKSETTINGS probe nwords=%d", ifname, nwords);
+
+    settings = alloc_link_ksettings(nwords);
+    if (settings == NULL) {
+        nb->last_error = ENOMEM;
+        errno = ENOMEM;
+        return -1;
+    }
+
+    settings->cmd = ETHTOOL_GLINKSETTINGS;
+    settings->link_mode_masks_nwords = (__s8) nwords;
+
+    ifr.ifr_data = (void *) settings;
+    if (ethtool_ioctl_retry(fd, &ifr) < 0) {
+        nb->last_error = errno;
+        flow_debug("ethtool(%s): GLINKSETTINGS full read failed errno=%d (%s)", ifname, errno, strerror(errno));
+        free(settings);
+        return -1;
+    }
+
+    flow_debug("ethtool(%s): GLINKSETTINGS full read OK (speed=%u duplex=%u)", ifname, settings->speed, settings->duplex);
+    *out = settings;
+    return 0;
+}
+
+static int ethtool_gset_legacy_ioctl(struct netif *nb, int fd, const char *ifname, struct netif_link_settings *ls)
 {
     struct ethtool_cmd ecmd = {0, };
     struct ifreq ifr = {0, };
@@ -341,16 +440,119 @@ static int ethtool_gset_ioctl(struct netif *nb, const char *ifname, struct netif
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
     ifr.ifr_data = (void *) &ecmd;
 
-    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
-        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+    if (ethtool_ioctl_retry(fd, &ifr) < 0) {
         nb->last_error = errno;
+        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
         return -1;
     }
 
     ls->speed  = (ecmd.speed_hi << 16) | ecmd.speed;
     ls->duplex = ecmd.duplex;
-
+    flow_debug("ethtool(%s): legacy ETHTOOL_GSET OK (speed=%u duplex=%u)", ifname, ls->speed, ls->duplex);
     return 0;
+}
+
+static int ethtool_sset_advertising_legacy_ioctl(struct netif *nb, int fd, const char *ifname,
+                                                 const __u32 advertising)
+{
+    struct ethtool_cmd ecmd = {0, };
+    struct ifreq ifr = {0, };
+
+    ecmd.cmd = ETHTOOL_GSET;
+
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    ifr.ifr_data = (void *) &ecmd;
+
+    /* Get current settings */
+    if (ethtool_ioctl_retry(fd, &ifr) < 0) {
+        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+        nb->last_error = errno;
+        return -1;
+    }
+
+    /* Enable autonegotiation */
+    ecmd.autoneg = AUTONEG_ENABLE;
+
+    ecmd.advertising = advertising;
+
+    /* Apply new settings */
+    ecmd.cmd = ETHTOOL_SSET;
+
+    if (ethtool_ioctl_retry(fd, &ifr) < 0) {
+        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_SSET", strerror(errno), ifname);
+        nb->last_error = errno;
+        return -1;
+    }
+
+    debug("Advertise mask updated successfully.\n");
+    flow_debug("ethtool(%s): legacy ETHTOOL_SSET advertising applied (mask=0x%08x)", ifname, advertising);
+    return 0;
+}
+
+static int ethtool_sset_speed_duplexity_legacy_ioctl(struct netif *nb, int fd, const char *ifname,
+                                                     const __u32 speed, const __u8 duplex)
+{
+    struct ethtool_cmd ecmd = {0, };
+    struct ifreq ifr = {0, };
+
+    ecmd.cmd = ETHTOOL_GSET;
+
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    ifr.ifr_data = (void *) &ecmd;
+
+    /* Get current settings */
+    if (ethtool_ioctl_retry(fd, &ifr) < 0) {
+	error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
+	nb->last_error = errno;
+	return -1;
+    }
+
+    /* Disable autonegotiation */
+    ecmd.autoneg = AUTONEG_DISABLE;
+
+    ecmd.speed = speed;
+    ecmd.duplex = duplex;
+
+    /* Apply new settings */
+    ecmd.cmd = ETHTOOL_SSET;
+
+    if (ethtool_ioctl_retry(fd, &ifr) < 0) {
+	error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_SSET", strerror(errno), ifname);
+	nb->last_error = errno;
+	return -1;
+    }
+
+    debug("Speed and duplexity updated successfully.\n");
+    flow_debug("ethtool(%s): legacy ETHTOOL_SSET speed/duplex applied (speed=%u duplex=%u)", ifname, speed, duplex);
+    return 0;
+}
+
+static int ethtool_gset_ioctl(struct netif *nb, const char *ifname, struct netif_link_settings *ls)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ethtool_link_settings *ksettings = NULL;
+    int rc = -1;
+
+    if (fd < 0) {
+        error("Failed to create socket for ethtool: %s", strerror(errno));
+        return -1;
+    }
+
+    /* Prefer modern API first; fall back to legacy GSET on failure. */
+    if (ethtool_glinksettings_get_ioctl(nb, fd, ifname, &ksettings) == 0) {
+        ls->speed = ksettings->speed;
+        ls->duplex = ksettings->duplex;
+        flow_debug("ethtool(%s): using modern GET path (GLINKSETTINGS)", ifname);
+        free(ksettings);
+        close(fd);
+        return 0;
+    }
+
+    flow_debug("ethtool(%s): modern GET failed (errno=%d), falling back to legacy GSET",
+          ifname, nb->last_error);
+    rc = ethtool_gset_legacy_ioctl(nb, fd, ifname, ls);
+    close(fd);
+    return rc;
 }
 
 /* Set ADVERTISE bitmask:
@@ -358,18 +560,15 @@ static int ethtool_gset_ioctl(struct netif *nb, const char *ifname, struct netif
 /**
  * @brief Set the advertised link modes for a network interface using ethtool ioctls.
  *
- * This function retrieves the current ethtool settings for the given network
- * interface, enables autonegotiation, updates the advertised link mode mask,
- * and then applies the modified configuration using the legacy ioctl-based
- * ETHTOOL_SSET command.
+ * This function first attempts the modern ethtool path:
+ * ETHTOOL_GLINKSETTINGS to read and ETHTOOL_SLINKSETTINGS to apply.
+ * If the modern path fails, it falls back to the legacy path:
+ * ETHTOOL_GSET to read and ETHTOOL_SSET to apply.
  *
- * The function uses ETHTOOL_GSET to read current PHY settings and
- * ETHTOOL_SSET to apply updated advertisement values. In case of errors,
- * it logs messages and updates the @ref netif::last_error field.
+ * In case of errors, it logs messages and updates @ref netif::last_error.
  *
  * @param nb
- *      Pointer to the netif structure holding the ioctl file descriptor and
- *      error tracking fields.
+ *      Pointer to the netif structure holding error tracking fields.
  * @param ifname
  *      Interface name (e.g. "eth0"). Must fit within IFNAMSIZ.
  * @param advertising
@@ -388,74 +587,94 @@ static int ethtool_gset_ioctl(struct netif *nb, const char *ifname, struct netif
  */
 static int ethtool_sset_advertising_ioctl(struct netif *nb, const char *ifname, const __u32 advertising)
 {
-    struct ethtool_cmd ecmd = {0, };
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ethtool_link_settings *ksettings = NULL;
     struct ifreq ifr = {0, };
+    int nwords;
+    __u32 *advertising_mask;
+    int rc;
 
-    ecmd.cmd = ETHTOOL_GSET;
-
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
-    ifr.ifr_data = (void *) &ecmd;
-
-    /* Get current settings */
-    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
-        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
-        nb->last_error = errno;
+    if (fd < 0) {
+        error("Failed to create socket for ethtool: %s", strerror(errno));
         return -1;
     }
 
-    /* Enable autonegotiation */
-    ecmd.autoneg = AUTONEG_ENABLE;
+    if (ethtool_glinksettings_get_ioctl(nb, fd, ifname, &ksettings) == 0) {
+        nwords = ksettings->link_mode_masks_nwords;
+        if (nwords > 0) {
+            advertising_mask = ksettings->link_mode_masks + nwords;
+            memset(advertising_mask, 0, (size_t) nwords * sizeof(__u32));
+            advertising_mask[0] = advertising;
+            ksettings->autoneg = AUTONEG_ENABLE;
+            ksettings->cmd = ETHTOOL_SLINKSETTINGS;
 
-    ecmd.advertising = advertising;
+            strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+            ifr.ifr_data = (void *) ksettings;
 
-    /* Apply new settings */
-    ecmd.cmd = ETHTOOL_SSET;
-
-    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
-        error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_SSET", strerror(errno), ifname);
-        return -1;
+            if (ethtool_ioctl_retry(fd, &ifr) == 0) {
+                flow_debug("ethtool(%s): using modern SET path (SLINKSETTINGS advertising mask=0x%08x)",
+                      ifname, advertising);
+                free(ksettings);
+                close(fd);
+                return 0;
+            }
+            nb->last_error = errno;
+            flow_debug("ethtool(%s): SLINKSETTINGS advertising failed errno=%d (%s)",
+                  ifname, errno, strerror(errno));
+        } else {
+            nb->last_error = EINVAL;
+        }
+        free(ksettings);
     }
 
-    debug("Advertise mask updated successfully.\n");
-
-    return 0;
+    flow_debug("ethtool(%s): falling back to legacy GSET/SSET for advertising (mask=0x%08x, errno=%d)",
+          ifname, advertising, nb->last_error);
+    rc = ethtool_sset_advertising_legacy_ioctl(nb, fd, ifname, advertising);
+    close(fd);
+    return rc;
 }
 
-/* Note: This function will first retrieve the current settings using ETHTOOL_GSET, then it will disable autonegotiation, set the desired speed and duplexity, and finally apply the new settings using ETHTOOL_SSET. On failure, it will log an error message and return -1, while on success it will return 0. */
+/* Set forced speed/duplex. Prefer GLINK/SLINK and fall back to GSET/SSET. */
 static int ethtool_sset_speed_duplexity_ioctl(struct netif *nb, const char *ifname, const __u32 speed, const __u8 duplex)
 {
-    struct ethtool_cmd ecmd = {0, };
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ethtool_link_settings *ksettings = NULL;
     struct ifreq ifr = {0, };
+    int rc;
 
-    ecmd.cmd = ETHTOOL_GSET;
-
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
-    ifr.ifr_data = (void *) &ecmd;
-
-    /* Get current settings */
-    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
-	error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
-	nb->last_error = errno;
-	return -1;
+    if (fd < 0) {
+        error("Failed to create socket for ethtool: %s", strerror(errno));
+        return -1;
     }
 
-    /* Disable autonegotiation */
-    ecmd.autoneg = AUTONEG_DISABLE;
+    if (ethtool_glinksettings_get_ioctl(nb, fd, ifname, &ksettings) == 0) {
+        ksettings->autoneg = AUTONEG_DISABLE;
+        ksettings->speed = speed;
+        ksettings->duplex = duplex;
+        ksettings->cmd = ETHTOOL_SLINKSETTINGS;
 
-    ecmd.speed = speed;
-    ecmd.duplex = duplex;
+        strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+        ifr.ifr_data = (void *) ksettings;
 
-    /* Apply new settings */
-    ecmd.cmd = ETHTOOL_SSET;
+        if (ethtool_ioctl_retry(fd, &ifr) == 0) {
+            flow_debug("ethtool(%s): using modern SET path (SLINKSETTINGS speed=%u duplex=%u)",
+                  ifname, speed, duplex);
+            free(ksettings);
+            close(fd);
+            return 0;
+        }
 
-    if (ioctl(nb->inet_fd, SIOCETHTOOL, &ifr) < 0) {
-	error("ioctl(0x%04x) failed for getting '%s': %s for %s", SIOCETHTOOL, "ETHTOOL_SSET", strerror(errno), ifname);
-	return -1;
+        nb->last_error = errno;
+        flow_debug("ethtool(%s): SLINKSETTINGS speed/duplex failed errno=%d (%s)",
+              ifname, errno, strerror(errno));
+        free(ksettings);
     }
 
-    debug("Speed and duplexity updated successfully.\n");
-
-    return 0;
+    flow_debug("ethtool(%s): falling back to legacy GSET/SSET for speed/duplex (speed=%u duplex=%u errno=%d)",
+          ifname, speed, duplex, nb->last_error);
+    rc = ethtool_sset_speed_duplexity_legacy_ioctl(nb, fd, ifname, speed, duplex);
+    close(fd);
+    return rc;
 }
 
 static int netif_build_ifinfo(const struct nlmsghdr *nlh, void *data)
@@ -513,19 +732,39 @@ static int netif_build_ifinfo(const struct nlmsghdr *nlh, void *data)
 
   if (tb[IFLA_IFNAME]) {
     struct netif_link_settings ls = {0, };
-
     int ret = 0;
+    const char *ifname = mnl_attr_get_str(tb[IFLA_IFNAME]);
 
-    if((ret = ethtool_gset_ioctl(nb, mnl_attr_get_str(tb[IFLA_IFNAME]), &ls)) == 0) {
+    if (nb->ifinfo_origin && strcmp(nb->ifinfo_origin, "notification") == 0) {
+      encode_kv_link_settings(nb, "link_settings", NULL);
+    } else if ((ret = ethtool_gset_ioctl(nb, ifname, &ls)) == 0) {
       encode_kv_link_settings(nb, "link_settings", &ls);
     } else {
-      error("[%s %d %s]: gset_ioctl returned %d!\r\n", __FILE__, __LINE__, __func__, ret);
+      int suppress_startup_status_ebusy = 0;
 
+      if (nb->last_error == EBUSY &&
+          nb->ifinfo_origin && strcmp(nb->ifinfo_origin, "status") == 0) {
+        time_t now = time(NULL);
+        double since_init_sec = difftime(now, nb->init_time);
+        if (since_init_sec >= 0 && since_init_sec <= STATUS_EBUSY_SUPPRESS_WINDOW_SEC)
+          suppress_startup_status_ebusy = 1;
+      }
+
+      if (suppress_startup_status_ebusy) {
+        if (!nb->status_ebusy_suppression_noted) {
+          flow_debug("ethtool(%s): suppressing startup EBUSY logs for origin=status (window=%ds)",
+                     ifname, STATUS_EBUSY_SUPPRESS_WINDOW_SEC);
+          nb->status_ebusy_suppression_noted = 1;
+        }
+      } else {
+        error("[%s %d %s]: gset_ioctl returned %d (errno=%d, origin=%s, ifname=%s)\r\n",
+              __FILE__, __LINE__, __func__, ret, nb->last_error,
+              nb->ifinfo_origin ? nb->ifinfo_origin : "unknown", ifname);
+      }
       encode_kv_link_settings(nb, "link_settings", NULL);
     }
   } else {
     warn("[%s %d %s]:  tb[IFLA_IFNAME] not present not encoding link settings!", __FILE__, __LINE__, __func__);
-
     encode_kv_link_settings(nb, "link_settings", NULL);
   }
 
@@ -613,6 +852,7 @@ static void handle_notification(struct netif *nb, int bytecount)
     // Currently, the only notifications are interface changes.
     ei_encode_atom(nb->resp, &nb->resp_index, "ifchanged");
 
+    nb->ifinfo_origin = "notification";
     if (mnl_cb_run(nb->nlbuf, bytecount, 0, 0, netif_build_ifinfo, nb) <= 0)
         err(EXIT_FAILURE, "mnl_cb_run");
 
@@ -691,6 +931,7 @@ static void netif_handle_status_callback(struct netif *nb, int bytecount)
 
     ei_encode_tuple_header(nb->resp, &nb->resp_index, 2);
     ei_encode_atom(nb->resp, &nb->resp_index, "ok");
+    nb->ifinfo_origin = "status";
     if (mnl_cb_run(nb->nlbuf, bytecount, nb->response_seq, nb->response_portid, netif_build_ifinfo, nb) < 0) {
         debugf("error from or mnl_cb_run?");
         nb->resp_index = original_resp_index;
