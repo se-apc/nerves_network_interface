@@ -63,7 +63,7 @@
 #define BMCR_ANRESTART_BIT 9
 #define BMCR_ANENABLE_BIT 12
 #define MII_BMCR_REG 0
-#define ETHTOOL_IOCTL_EBUSY_RETRIES 5
+#define ETHTOOL_IOCTL_EBUSY_RETRIES 17
 #define ETHTOOL_IOCTL_EBUSY_RETRY_DELAY_US 50000
 #define STATUS_EBUSY_SUPPRESS_WINDOW_SEC 120
 
@@ -761,9 +761,7 @@ static int netif_build_ifinfo(const struct nlmsghdr *nlh, void *data)
     int ret = 0;
     const char *ifname = mnl_attr_get_str(tb[IFLA_IFNAME]);
 
-    if (nb->ifinfo_origin && strcmp(nb->ifinfo_origin, "notification") == 0) {
-      encode_kv_link_settings(nb, "link_settings", NULL);
-    } else if ((ret = ethtool_gset_ioctl(nb, ifname, &ls)) == 0) {
+    if ((ret = ethtool_gset_ioctl(nb, ifname, &ls)) == 0) {
       encode_kv_link_settings(nb, "link_settings", &ls);
     } else {
       int suppress_startup_status_ebusy = 0;
