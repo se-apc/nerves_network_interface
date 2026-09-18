@@ -65,6 +65,8 @@
 #define MII_BMCR_REG 0
 #define ETHTOOL_IOCTL_EBUSY_RETRIES 17
 #define ETHTOOL_IOCTL_EBUSY_RETRY_DELAY_US 50000
+/* Keep nested complete-read retries below the 5-second port call timeout. */
+#define ETHTOOL_GSET_EBUSY_RETRIES 1
 #define STATUS_EBUSY_SUPPRESS_WINDOW_SEC 120
 
 #include "erlcmd.h"
@@ -456,13 +458,8 @@ static int ethtool_gset_legacy_ioctl(struct netif *nb, int fd, const char *ifnam
 
     if (ethtool_ioctl_retry(fd, &ifr) < 0) {
         nb->last_error = errno;
-        if (should_suppress_bootstrap_ebusy(nb, errno)) {
-            debug("ioctl(0x%04x) failed for getting '%s': %s for %s (suppressed during bootstrap)",
-                  SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
-        } else {
-            error("ioctl(0x%04x) failed for getting '%s': %s for %s",
-                  SIOCETHTOOL, "ETHTOOL_GSET", strerror(errno), ifname);
-        }
+        flow_debug("ethtool(%s): legacy ETHTOOL_GSET failed errno=%d (%s)",
+              ifname, errno, strerror(errno));
         return -1;
     }
 
@@ -556,27 +553,44 @@ static int ethtool_sset_speed_duplexity_legacy_ioctl(struct netif *nb, int fd, c
 static int ethtool_gset_ioctl(struct netif *nb, const char *ifname, struct netif_link_settings *ls)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct ethtool_link_settings *ksettings = NULL;
+    int attempt;
     int rc = -1;
 
     if (fd < 0) {
+        nb->last_error = errno;
         error("Failed to create socket for ethtool: %s", strerror(errno));
         return -1;
     }
 
-    /* Prefer modern API first; fall back to legacy GSET on failure. */
-    if (ethtool_glinksettings_get_ioctl(nb, fd, ifname, &ksettings) == 0) {
-        ls->speed = ksettings->speed;
-        ls->duplex = ksettings->duplex;
-        flow_debug("ethtool(%s): using modern GET path (GLINKSETTINGS)", ifname);
-        free(ksettings);
-        close(fd);
-        return 0;
+    for (attempt = 0; attempt <= ETHTOOL_GSET_EBUSY_RETRIES; attempt++) {
+        struct ethtool_link_settings *ksettings = NULL;
+
+        /* Prefer modern API first; don't treat a transient EBUSY as unsupported. */
+        if (ethtool_glinksettings_get_ioctl(nb, fd, ifname, &ksettings) == 0) {
+            ls->speed = ksettings->speed;
+            ls->duplex = ksettings->duplex;
+            flow_debug("ethtool(%s): using modern GET path (GLINKSETTINGS)", ifname);
+            free(ksettings);
+            rc = 0;
+            break;
+        }
+
+        if (nb->last_error != EBUSY) {
+            flow_debug("ethtool(%s): modern GET failed (errno=%d), falling back to legacy GSET",
+                  ifname, nb->last_error);
+            rc = ethtool_gset_legacy_ioctl(nb, fd, ifname, ls);
+            if (rc == 0 || nb->last_error != EBUSY)
+                break;
+        }
+
+        if (attempt == ETHTOOL_GSET_EBUSY_RETRIES)
+            break;
+
+        flow_debug("ethtool(%s): link settings busy, retrying complete read (%d/%d)",
+              ifname, attempt + 1, ETHTOOL_GSET_EBUSY_RETRIES);
+        usleep(ETHTOOL_IOCTL_EBUSY_RETRY_DELAY_US);
     }
 
-    flow_debug("ethtool(%s): modern GET failed (errno=%d), falling back to legacy GSET",
-          ifname, nb->last_error);
-    rc = ethtool_gset_legacy_ioctl(nb, fd, ifname, ls);
     close(fd);
     return rc;
 }
@@ -765,6 +779,7 @@ static int netif_build_ifinfo(const struct nlmsghdr *nlh, void *data)
       encode_kv_link_settings(nb, "link_settings", &ls);
     } else {
       int suppress_startup_status_ebusy = 0;
+      int suppress_notification_ebusy = 0;
 
       if (nb->last_error == EBUSY &&
           nb->ifinfo_origin && strcmp(nb->ifinfo_origin, "status") == 0) {
@@ -774,12 +789,25 @@ static int netif_build_ifinfo(const struct nlmsghdr *nlh, void *data)
           suppress_startup_status_ebusy = 1;
       }
 
+      /* A PHY link-mode change keeps the ethtool ioctl busy for longer than we
+       * can safely retry synchronously without risking the port call timeout.
+       * On "notification" origin this is expected/transient (a follow-up
+       * notification or status read will pick up the settled value), so don't
+       * spam ERROR logs for it - just note it at debug level. */
+      if (nb->last_error == EBUSY &&
+          nb->ifinfo_origin && strcmp(nb->ifinfo_origin, "notification") == 0) {
+        suppress_notification_ebusy = 1;
+      }
+
       if (suppress_startup_status_ebusy) {
         if (!nb->status_ebusy_suppression_noted) {
           flow_debug("ethtool(%s): suppressing startup EBUSY logs for origin=status (window=%ds)",
                      ifname, STATUS_EBUSY_SUPPRESS_WINDOW_SEC);
           nb->status_ebusy_suppression_noted = 1;
         }
+      } else if (suppress_notification_ebusy) {
+        flow_debug("ethtool(%s): link settings busy for origin=notification, deferring to next read",
+                   ifname);
       } else {
         error("[%s %d %s]: gset_ioctl returned %d (errno=%d, origin=%s, ifname=%s)\r\n",
               __FILE__, __LINE__, __func__, ret, nb->last_error,
